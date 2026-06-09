@@ -82,10 +82,8 @@ class WSReadout(nn.Module):
     def forward(self, seq, query):
         query = query.permute(0,2,1)
         sim = torch.matmul(seq,query)
-        sim = F.softmax(sim,dim=1)
-        sim = sim.repeat(1, 1, 64)
-        out = torch.mul(seq,sim)
-        out = torch.sum(out,1)
+        sim = F.softmax(sim, dim=1)
+        out = torch.sum(seq * sim, dim=1)
         return out
 
 
@@ -109,14 +107,12 @@ class Discriminator(nn.Module):
                 m.bias.data.fill_(0.0)
 
     def forward(self, c, h_pl, s_bias1=None, s_bias2=None):
-        scs = []
-        scs.append(self.f_k(h_pl, c))
+        scs = [self.f_k(h_pl, c)]
         c_mi = c
         for _ in range(self.negsamp_round):
-            c_mi = torch.cat((c_mi[-1, :].unsqueeze(0), c_mi[:-1, :]), dim=0)
+            c_mi = torch.roll(c_mi, shifts=1, dims=0)
             scs.append(self.f_k(h_pl, c_mi))
-        logits = torch.cat(tuple(scs))
-        return logits
+        return torch.cat(scs, dim=0)
 
 
 class Model(nn.Module):

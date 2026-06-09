@@ -24,14 +24,13 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
-    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
 def pr_auc_score(y_true, y_score) -> float:
     precision, recall, _ = precision_recall_curve(y_true, y_score)
-    # sklearn returns recall in descending order; reverse for trapezoidal auc.
     return float(auc(recall[::-1], precision[::-1]))
 
 
@@ -102,7 +101,7 @@ def preprocess_features(features):
     r_inv[np.isinf(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
     features = r_mat_inv.dot(features)
-    return features.todense(), sparse_to_tuple(features)
+    return np.asarray(features.todense(), dtype=np.float32), sparse_to_tuple(features)
 
 
 def normalize_adj(adj):
@@ -143,14 +142,6 @@ def _first_existing_key(data, keys):
 
 
 def load_mat(dataset, data_root="~/datasets/GAD/mat", train_rate=0.3, val_rate=0.1):
-    """Load GAD .mat dataset from ~/datasets/GAD/mat by default.
-
-    Expected common keys:
-    - adjacency: Network or A
-    - attributes: Attributes or X
-    - anomaly labels: Label or gnd
-    - optional class labels: Class
-    """
     path = os.path.join(os.path.expanduser(data_root), f"{dataset}.mat")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dataset file not found: {path}")
@@ -168,7 +159,6 @@ def load_mat(dataset, data_root="~/datasets/GAD/mat", train_rate=0.3, val_rate=0
         num_classes = int(np.max(labels_dense)) + 1
         labels = dense_to_one_hot(labels_dense, num_classes)
     else:
-        # Some GAD datasets only provide anomaly labels. The training code does not use class labels.
         labels = np.zeros((adj.shape[0], 1), dtype=np.float32)
 
     ano_labels = np.squeeze(np.array(label)).astype(np.int64)
@@ -187,12 +177,6 @@ def load_mat(dataset, data_root="~/datasets/GAD/mat", train_rate=0.3, val_rate=0
 
 
 def adj_to_pyg_data(adj: sp.spmatrix, make_undirected: bool = True) -> Data:
-    """Convert scipy adjacency to a PyG Data object.
-
-    This replaces the old DGLGraph construction. The current SL-GAD training loop
-    still uses dense local subgraph adjacencies, while PyG is used for graph storage
-    and RWR-style subgraph sampling.
-    """
     edge_index, edge_weight = from_scipy_sparse_matrix(adj.tocoo())
     edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
     if make_undirected:
@@ -208,7 +192,6 @@ def build_neighbor_lists(edge_index: torch.Tensor, num_nodes: int) -> List[List[
     for u, v in zip(src, dst):
         if u != v:
             neighbors[u].append(v)
-    # Deduplicate to avoid overweighting duplicate edges after to_undirected/coalescing differences.
     return [list(dict.fromkeys(nbrs)) for nbrs in neighbors]
 
 
@@ -219,11 +202,6 @@ def _sample_rwr_unique_nodes(
     restart_prob: float,
     max_steps: int,
 ) -> List[int]:
-    """Collect unique nodes using random walk with restart.
-
-    The returned list excludes the seed when possible. The caller appends the seed as
-    the final/main-vertex position, matching the original SL-GAD layout.
-    """
     if target_size <= 0:
         return []
 
@@ -248,20 +226,19 @@ def _sample_rwr_unique_nodes(
     return visited
 
 
-def generate_rwr_subgraph(
-    pyg_data: Data,
+def generate_rwr_subgraph_from_neighbors(
+    neighbors: Sequence[Sequence[int]],
     subgraph_size: int,
     restart_prob: float = 0.9,
     max_steps_factor: int = 5,
 ) -> List[List[int]]:
-    """Generate per-node RWR subgraphs without DGL.
+    """Generate RWR subgraphs using precomputed neighbor lists.
 
-    Output format matches the original function:
-    [neighbor_1, ..., neighbor_{subgraph_size-1}, center_node]
+    Avoids rebuilding neighbor lists for every epoch/test round.
+    Output format: [neighbor_1, ..., neighbor_{subgraph_size-1}, center_node].
     """
-    num_nodes = int(pyg_data.num_nodes)
+    num_nodes = len(neighbors)
     reduced_size = subgraph_size - 1
-    neighbors = build_neighbor_lists(pyg_data.edge_index, num_nodes)
     subgraphs = []
 
     for seed in range(num_nodes):
@@ -290,7 +267,6 @@ def generate_rwr_subgraph(
             retry_time += 1
 
         if len(nodes) < reduced_size:
-            # Isolated or very low-degree node: pad deterministically with the seed.
             pad_value = nodes[-1] if nodes else seed
             nodes = (nodes + [pad_value] * reduced_size)[:reduced_size]
         else:
@@ -299,3 +275,18 @@ def generate_rwr_subgraph(
         nodes.append(seed)
         subgraphs.append(nodes)
     return subgraphs
+
+
+def generate_rwr_subgraph(
+    pyg_data: Data,
+    subgraph_size: int,
+    restart_prob: float = 0.9,
+    max_steps_factor: int = 5,
+) -> List[List[int]]:
+    neighbors = build_neighbor_lists(pyg_data.edge_index, int(pyg_data.num_nodes))
+    return generate_rwr_subgraph_from_neighbors(
+        neighbors,
+        subgraph_size=subgraph_size,
+        restart_prob=restart_prob,
+        max_steps_factor=max_steps_factor,
+    )

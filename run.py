@@ -15,19 +15,28 @@ from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
 
 from model import Model
-from utils import adj_to_pyg_data, generate_rwr_subgraph, load_mat, normalize_adj, preprocess_features, set_seed, pr_auc_score
+from utils import (
+    adj_to_pyg_data,
+    build_neighbor_lists,
+    generate_rwr_subgraph_from_neighbors,
+    load_mat,
+    normalize_adj,
+    pr_auc_score,
+    preprocess_features,
+    set_seed,
+)
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="SL-GAD PyG refactor")
+    parser = argparse.ArgumentParser(description="SL-GAD PyG resource-optimized refactor")
     parser.add_argument("--expid", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dataset", type=str, default="BlogCatalog")
     parser.add_argument("--data_root", type=str, default="~/datasets/GAD/mat")
     parser.add_argument("--result_csv", type=str, default="results/slgad_results.csv")
-    parser.add_argument("--cache_dir", type=str, default="tmp")
+    parser.add_argument("--cache_dir", type=str, default="tmp", help="Kept for CLI compatibility; no checkpoint is written by default.")
 
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -66,92 +75,64 @@ def append_result_csv(path: str, row: Dict[str, str]):
         writer.writerow(row)
 
 
-def make_batch_tensors(
-    idx,
-    subgraphs_1,
-    subgraphs_2,
-    adj,
-    features,
-    raw_features,
-    subgraph_size,
-    ft_size,
-    device,
-):
-    cur_batch_size = len(idx)
-    ba1, ba2, bf1, bf2, raw_bf1, raw_bf2 = [], [], [], [], [], []
+def _local_adj_batch(adj_csr: sp.csr_matrix, subgraphs, device) -> torch.Tensor:
+    """Build only small B×S×S local adjacency tensors for the current batch."""
+    mats = [adj_csr[sg, :][:, sg].toarray() for sg in subgraphs]
+    return torch.as_tensor(np.stack(mats, axis=0), dtype=torch.float32, device=device)
 
-    added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size), device=device)
-    added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1), device=device)
-    added_adj_zero_col[:, -1, :] = 1.0
-    added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size), device=device)
 
-    for i in idx:
-        sg1 = subgraphs_1[i]
-        sg2 = subgraphs_2[i]
-        cur_adj_1 = adj[:, sg1, :][:, :, sg1]
-        cur_adj_2 = adj[:, sg2, :][:, :, sg2]
-        cur_feat_1 = features[:, sg1, :]
-        cur_feat_2 = features[:, sg2, :]
-        raw_cur_feat_1 = raw_features[:, sg1, :]
-        raw_cur_feat_2 = raw_features[:, sg2, :]
+def _insert_anchor_gap(x: torch.Tensor) -> torch.Tensor:
+    zero = x.new_zeros((x.shape[0], 1, x.shape[2]))
+    return torch.cat((x[:, :-1, :], zero, x[:, -1:, :]), dim=1)
 
-        ba1.append(cur_adj_1)
-        ba2.append(cur_adj_2)
-        bf1.append(cur_feat_1)
-        bf2.append(cur_feat_2)
-        raw_bf1.append(raw_cur_feat_1)
-        raw_bf2.append(raw_cur_feat_2)
 
-    ba1 = torch.cat(ba1)
-    ba1 = torch.cat((ba1, added_adj_zero_row), dim=1)
-    ba1 = torch.cat((ba1, added_adj_zero_col), dim=2)
-    ba2 = torch.cat(ba2)
-    ba2 = torch.cat((ba2, added_adj_zero_row), dim=1)
-    ba2 = torch.cat((ba2, added_adj_zero_col), dim=2)
+def _append_adj_anchor(adj_batch: torch.Tensor) -> torch.Tensor:
+    batch_size, subgraph_size, _ = adj_batch.shape
+    zero_row = adj_batch.new_zeros((batch_size, 1, subgraph_size))
+    adj_batch = torch.cat((adj_batch, zero_row), dim=1)
+    zero_col = adj_batch.new_zeros((batch_size, subgraph_size + 1, 1))
+    zero_col[:, -1, :] = 1.0
+    return torch.cat((adj_batch, zero_col), dim=2)
 
-    bf1 = torch.cat(bf1)
-    bf1 = torch.cat((bf1[:, :-1, :], added_feat_zero_row, bf1[:, -1:, :]), dim=1)
-    bf2 = torch.cat(bf2)
-    bf2 = torch.cat((bf2[:, :-1, :], added_feat_zero_row, bf2[:, -1:, :]), dim=1)
 
-    raw_bf1 = torch.cat(raw_bf1)
-    raw_bf1 = torch.cat((raw_bf1[:, :-1, :], added_feat_zero_row, raw_bf1[:, -1:, :]), dim=1)
-    raw_bf2 = torch.cat(raw_bf2)
-    raw_bf2 = torch.cat((raw_bf2[:, :-1, :], added_feat_zero_row, raw_bf2[:, -1:, :]), dim=1)
+def make_batch_tensors(idx, subgraphs_1, subgraphs_2, adj_csr, features_t, raw_features_t, device):
+    sg1 = [subgraphs_1[i] for i in idx]
+    sg2 = [subgraphs_2[i] for i in idx]
+    sg1_t = torch.as_tensor(sg1, dtype=torch.long, device=device)
+    sg2_t = torch.as_tensor(sg2, dtype=torch.long, device=device)
+
+    ba1 = _append_adj_anchor(_local_adj_batch(adj_csr, sg1, device))
+    ba2 = _append_adj_anchor(_local_adj_batch(adj_csr, sg2, device))
+    bf1 = _insert_anchor_gap(features_t[sg1_t])
+    bf2 = _insert_anchor_gap(features_t[sg2_t])
+    raw_bf1 = _insert_anchor_gap(raw_features_t[sg1_t])
+    raw_bf2 = _insert_anchor_gap(raw_features_t[sg2_t])
     return ba1, ba2, bf1, bf2, raw_bf1, raw_bf2
 
 
-def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]:
-    (
-        adj,
-        features,
-        labels,
-        idx_train,
-        idx_val,
-        idx_test,
-        ano_label,
-        str_ano_label,
-        attr_ano_label,
-    ) = data_bundle
+def _best_state_dict_on_cpu(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
+
+def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]:
+    adj, features, labels, idx_train, idx_val, idx_test, ano_label, str_ano_label, attr_ano_label = data_bundle
     set_seed(seed)
 
-    raw_features = features.todense()
+    raw_features = np.asarray(features.todense(), dtype=np.float32)
     features, _ = preprocess_features(features)
     pyg_graph = adj_to_pyg_data(adj)
+    neighbors = build_neighbor_lists(pyg_graph.edge_index, int(pyg_graph.num_nodes))
 
-    nb_nodes = features.shape[0]
-    ft_size = features.shape[1]
+    nb_nodes, ft_size = features.shape
     batch_size = args.batch_size
-    subgraph_size = args.subgraph_size
-    batch_num = nb_nodes // batch_size + 1
+    batch_num = (nb_nodes + batch_size - 1) // batch_size
 
-    adj_norm = normalize_adj(adj)
-    adj_norm = (adj_norm + sp.eye(adj_norm.shape[0])).todense()
+    # Keep normalized adjacency on CPU in sparse CSR format.  The previous code created
+    # a dense N×N tensor on GPU, which is the largest avoidable memory cost.
+    adj_norm = (normalize_adj(adj) + sp.eye(adj.shape[0], dtype=np.float32)).tocsr().astype(np.float32)
 
-    features_t = torch.FloatTensor(features[np.newaxis]).to(device)
-    raw_features_t = torch.FloatTensor(raw_features[np.newaxis]).to(device)
-    adj_t = torch.FloatTensor(adj_norm[np.newaxis]).to(device)
+    features_t = torch.as_tensor(features, dtype=torch.float32, device=device)
+    raw_features_t = torch.as_tensor(raw_features, dtype=torch.float32, device=device)
 
     model = Model(ft_size, args.embedding_dim, "prelu", args.negsamp_ratio, args.readout).to(device)
     optimiser = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -161,48 +142,50 @@ def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]
     mse_loss = nn.MSELoss(reduction="mean")
 
     cnt_wait = 0
-    best = 1e9
+    best = float("inf")
     best_t = 0
+    best_state = _best_state_dict_on_cpu(model)
 
-    loop = range(args.num_epoch)
+    epoch_loop = range(args.num_epoch)
     if args.tqdm:
-        loop = tqdm(loop, desc="Epoch", position=1, leave=False)
-    for epoch in loop:
+        epoch_loop = tqdm(epoch_loop, desc="Epoch", position=1, leave=False)
+
+    for epoch in epoch_loop:
         model.train()
         all_idx = list(range(nb_nodes))
         random.shuffle(all_idx)
         total_loss = 0.0
+        seen_nodes = 0
 
-        subgraphs_1 = generate_rwr_subgraph(
-            pyg_graph, subgraph_size, restart_prob=args.rwr_restart_prob
+        subgraphs_1 = generate_rwr_subgraph_from_neighbors(
+            neighbors, args.subgraph_size, restart_prob=args.rwr_restart_prob
         )
-        subgraphs_2 = generate_rwr_subgraph(
-            pyg_graph, subgraph_size, restart_prob=args.rwr_restart_prob
+        subgraphs_2 = generate_rwr_subgraph_from_neighbors(
+            neighbors, args.subgraph_size, restart_prob=args.rwr_restart_prob
         )
 
         for batch_idx in range(batch_num):
-            optimiser.zero_grad()
-            is_final_batch = batch_idx == (batch_num - 1)
-            if not is_final_batch:
-                idx = all_idx[batch_idx * batch_size:(batch_idx + 1) * batch_size]
-            else:
-                idx = all_idx[batch_idx * batch_size:]
-            if len(idx) == 0:
+            idx = all_idx[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+            if not idx:
                 continue
             cur_batch_size = len(idx)
-            lbl = torch.unsqueeze(
-                torch.cat((torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio))),
-                1,
-            ).to(device)
+            seen_nodes += cur_batch_size
 
-            ba1, ba2, bf1, bf2, raw_bf1, raw_bf2 = make_batch_tensors(
-                idx, subgraphs_1, subgraphs_2, adj_t, features_t, raw_features_t,
-                subgraph_size, ft_size, device
+            lbl = torch.cat(
+                (
+                    torch.ones(cur_batch_size, 1, device=device),
+                    torch.zeros(cur_batch_size * args.negsamp_ratio, 1, device=device),
+                ),
+                dim=0,
             )
 
+            ba1, ba2, bf1, bf2, raw_bf1, raw_bf2 = make_batch_tensors(
+                idx, subgraphs_1, subgraphs_2, adj_norm, features_t, raw_features_t, device
+            )
+
+            optimiser.zero_grad(set_to_none=True)
             logits, f_1, f_2 = model(bf1, bf2, raw_bf1, raw_bf2, ba1, ba2)
-            loss_all = b_xent(logits, lbl)
-            loss1 = torch.mean(loss_all)
+            loss1 = torch.mean(b_xent(logits, lbl))
             loss2 = 0.5 * (
                 mse_loss(f_1[:, -2, :], raw_bf1[:, -1, :])
                 + mse_loss(f_2[:, -2, :], raw_bf2[:, -1, :])
@@ -211,87 +194,74 @@ def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]
             loss.backward()
             optimiser.step()
 
-            loss_value = float(loss.detach().cpu().item())
-            if not is_final_batch:
-                total_loss += loss_value
+            total_loss += float(loss.detach()) * cur_batch_size
 
-        mean_loss = (total_loss * batch_size + loss_value * cur_batch_size) / nb_nodes
+        mean_loss = total_loss / max(seen_nodes, 1)
         if mean_loss < best:
             best = mean_loss
             best_t = epoch
             cnt_wait = 0
-            torch.save(model.state_dict(), args.checkpoint_path)
+            best_state = _best_state_dict_on_cpu(model)
         else:
             cnt_wait += 1
-            if cnt_wait == args.patience:
+            if cnt_wait >= args.patience:
                 break
 
-    model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
+    model.load_state_dict(best_state)
     model.eval()
-    multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float64)
+    multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float32)
 
-    loop = range(args.auc_test_rounds)
+    test_loop = range(args.auc_test_rounds)
     if args.tqdm:
-        loop = tqdm(loop, desc="Test", position=1, leave=False)
-    for round_idx in loop:
-        all_idx = list(range(nb_nodes))
-        random.shuffle(all_idx)
-        subgraphs_1 = generate_rwr_subgraph(
-            pyg_graph, subgraph_size, restart_prob=args.rwr_restart_prob
-        )
-        subgraphs_2 = generate_rwr_subgraph(
-            pyg_graph, subgraph_size, restart_prob=args.rwr_restart_prob
-        )
+        test_loop = tqdm(test_loop, desc="Test", position=1, leave=False)
 
-        for batch_idx in range(batch_num):
-            is_final_batch = batch_idx == (batch_num - 1)
-            if not is_final_batch:
-                idx = all_idx[batch_idx * batch_size:(batch_idx + 1) * batch_size]
-            else:
-                idx = all_idx[batch_idx * batch_size:]
-            if len(idx) == 0:
-                continue
-            cur_batch_size = len(idx)
-
-            ba1, ba2, bf1, bf2, raw_bf1, raw_bf2 = make_batch_tensors(
-                idx, subgraphs_1, subgraphs_2, adj_t, features_t, raw_features_t,
-                subgraph_size, ft_size, device
+    with torch.inference_mode():
+        for round_idx in test_loop:
+            all_idx = list(range(nb_nodes))
+            random.shuffle(all_idx)
+            subgraphs_1 = generate_rwr_subgraph_from_neighbors(
+                neighbors, args.subgraph_size, restart_prob=args.rwr_restart_prob
+            )
+            subgraphs_2 = generate_rwr_subgraph_from_neighbors(
+                neighbors, args.subgraph_size, restart_prob=args.rwr_restart_prob
             )
 
-            with torch.no_grad():
+            for batch_idx in range(batch_num):
+                idx = all_idx[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+                if not idx:
+                    continue
+                cur_batch_size = len(idx)
+
+                ba1, ba2, bf1, bf2, raw_bf1, raw_bf2 = make_batch_tensors(
+                    idx, subgraphs_1, subgraphs_2, adj_norm, features_t, raw_features_t, device
+                )
                 logits, dist = model.inference(bf1, bf2, raw_bf1, raw_bf2, ba1, ba2)
-            logits = torch.sigmoid(torch.squeeze(logits))
+                logits = torch.sigmoid(torch.squeeze(logits))
 
-            if args.alpha != 0.0 and args.beta != 0.0:
-                scaler1 = MinMaxScaler()
-                scaler2 = MinMaxScaler()
-                if args.negsamp_ratio == 1:
-                    ano_score_1 = -(
-                        logits[:cur_batch_size] - logits[cur_batch_size:]
-                    ).cpu().numpy()
+                if args.alpha != 0.0 and args.beta != 0.0:
+                    if args.negsamp_ratio == 1:
+                        ano_score_1 = -(logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
+                    else:
+                        pos_ano_score = logits[:cur_batch_size]
+                        neg_ano_score = logits[cur_batch_size:].view(-1, cur_batch_size).mean(dim=0)
+                        ano_score_1 = -(pos_ano_score - neg_ano_score).cpu().numpy()
+                    ano_score_2 = dist.cpu().numpy()
+                    ano_score_1 = MinMaxScaler().fit_transform(ano_score_1.reshape(-1, 1)).reshape(-1)
+                    ano_score_2 = MinMaxScaler().fit_transform(ano_score_2.reshape(-1, 1)).reshape(-1)
+                    ano_score = args.alpha * ano_score_1 + args.beta * ano_score_2
+                elif args.alpha != 0.0:
+                    if args.negsamp_ratio == 1:
+                        ano_score = -(logits[:cur_batch_size] - logits[cur_batch_size:]).cpu().numpy()
+                    else:
+                        pos_ano_score = logits[:cur_batch_size]
+                        neg_ano_score = logits[cur_batch_size:].view(-1, cur_batch_size).mean(dim=0)
+                        ano_score = -(pos_ano_score - neg_ano_score).cpu().numpy()
+                elif args.beta != 0.0:
+                    ano_score = dist.cpu().numpy()
                 else:
-                    pos_ano_score = logits[:cur_batch_size]
-                    neg_ano_score = logits[cur_batch_size:].view(-1, cur_batch_size).mean(dim=0)
-                    ano_score_1 = -(pos_ano_score - neg_ano_score).cpu().numpy()
-                ano_score_2 = dist.cpu().numpy()
-                ano_score_1 = scaler1.fit_transform(ano_score_1.reshape(-1, 1)).reshape(-1)
-                ano_score_2 = scaler2.fit_transform(ano_score_2.reshape(-1, 1)).reshape(-1)
-                ano_score = args.alpha * ano_score_1 + args.beta * ano_score_2
-            elif args.alpha != 0.0 and args.beta == 0.0:
-                if args.negsamp_ratio == 1:
-                    ano_score = -(
-                        logits[:cur_batch_size] - logits[cur_batch_size:]
-                    ).cpu().numpy()
-                else:
-                    pos_ano_score = logits[:cur_batch_size]
-                    neg_ano_score = logits[cur_batch_size:].view(-1, cur_batch_size).mean(dim=0)
-                    ano_score = -(pos_ano_score - neg_ano_score).cpu().numpy()
-            elif args.alpha == 0.0 and args.beta != 0.0:
-                ano_score = dist.cpu().numpy()
-            else:
-                raise ValueError("alpha and beta cannot be zero at the same time.")
+                    raise ValueError("alpha and beta cannot be zero at the same time.")
 
-            multi_round_ano_score[round_idx, idx] = ano_score
+                multi_round_ano_score[round_idx, idx] = ano_score
 
     ano_score_final = np.mean(multi_round_ano_score, axis=0)
     roc_auc = float(roc_auc_score(ano_label, ano_score_final))
@@ -302,17 +272,13 @@ def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]
 def main():
     args = build_parser().parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    args.checkpoint_path = cache_dir / "checkpoint.pkl"
-
     data_bundle = load_mat(args.dataset, data_root=args.data_root)
 
     auc_values, auprc_values, trained_epochs = [], [], []
-    loop = range(args.trials)
+    trial_loop = range(args.trials)
     if args.tqdm:
-        loop = tqdm(loop, desc="Trial", position=0, leave=True)
-    for trial in loop:
+        trial_loop = tqdm(trial_loop, desc="Trial", position=0, leave=True)
+    for trial in trial_loop:
         roc_auc, auprc, best_epoch = train_one_trial(args, args.seed + trial, data_bundle, device)
         auc_values.append(roc_auc)
         auprc_values.append(auprc)
@@ -323,6 +289,7 @@ def main():
         "time": finished_at,
         "dataset": args.dataset,
         "trials": args.trials,
+        "epochs": f"{np.mean(trained_epochs):.1f}({max(trained_epochs)})",
         "auc": format_metric(auc_values),
         "auprc": format_metric(auprc_values),
     }
@@ -331,6 +298,7 @@ def main():
     print("==============================")
     print(f"Dataset: {args.dataset}")
     print(f"Trials: {args.trials}")
+    print(f"Epochs: {row['epochs']}")
     print(f"AUC: {row['auc']}")
     print(f"AUPRC: {row['auprc']}")
     print(f"CSV: {os.path.expanduser(args.result_csv)}")
