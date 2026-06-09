@@ -7,8 +7,32 @@ import scipy.io as sio
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
+from sklearn.metrics import auc, precision_recall_curve
 from torch_geometric.data import Data
-from torch_geometric.utils import from_scipy_sparse_matrix, remove_self_loops, to_undirected
+from torch_geometric.utils import (
+    from_scipy_sparse_matrix,
+    remove_self_loops,
+    to_undirected,
+)
+
+
+def set_seed(seed: int):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def pr_auc_score(y_true, y_score) -> float:
+    precision, recall, _ = precision_recall_curve(y_true, y_score)
+    # sklearn returns recall in descending order; reverse for trapezoidal auc.
+    return float(auc(recall[::-1], precision[::-1]))
 
 
 def parse_skipgram(fname):

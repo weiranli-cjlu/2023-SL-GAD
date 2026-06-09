@@ -10,12 +10,12 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
-from sklearn.metrics import auc, precision_recall_curve, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
 
 from model import Model
-from utils import adj_to_pyg_data, generate_rwr_subgraph, load_mat, normalize_adj, preprocess_features
+from utils import adj_to_pyg_data, generate_rwr_subgraph, load_mat, normalize_adj, preprocess_features, set_seed, pr_auc_score
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -27,9 +27,9 @@ def build_parser():
     parser.add_argument("--dataset", type=str, default="BlogCatalog")
     parser.add_argument("--data_root", type=str, default="~/datasets/GAD/mat")
     parser.add_argument("--result_csv", type=str, default="results/slgad_results.csv")
-    parser.add_argument("--checkpoint_dir", type=str, default="tmp")
+    parser.add_argument("--cache_dir", type=str, default="tmp")
 
-    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--trials", type=int, default=5, help="Number of independent trials.")
     parser.add_argument("--seed", type=int, default=1, help="Base random seed. Trial i uses seed+i.")
@@ -37,7 +37,7 @@ def build_parser():
 
     parser.add_argument("--embedding_dim", type=int, default=64)
     parser.add_argument("--patience", type=int, default=400)
-    parser.add_argument("--num_epoch", type=int, default=None)
+    parser.add_argument("--num_epoch", type=int, default=400)
     parser.add_argument("--drop_prob", type=float, default=0.0)
     parser.add_argument("--batch_size", type=int, default=300)
     parser.add_argument("--subgraph_size", type=int, default=4)
@@ -48,43 +48,6 @@ def build_parser():
     parser.add_argument("--beta", type=float, default=0.6)
     parser.add_argument("--rwr_restart_prob", type=float, default=0.9)
     return parser
-
-
-def set_seed(seed: int):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    os.environ["OMP_NUM_THREADS"] = "1"
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def resolve_defaults(args):
-    if args.lr is None:
-        if args.dataset in ["cora", "citeseer", "pubmed", "Flickr", "ACM"]:
-            args.lr = 1e-3
-        elif args.dataset == "BlogCatalog":
-            args.lr = 3e-3
-        else:
-            args.lr = 1e-3
-    if args.num_epoch is None:
-        if args.dataset in ["cora", "citeseer", "pubmed"]:
-            args.num_epoch = 100
-        elif args.dataset in ["BlogCatalog", "Flickr", "ACM"]:
-            args.num_epoch = 400
-        else:
-            args.num_epoch = 400
-    return args
-
-
-def pr_auc_score(y_true, y_score) -> float:
-    precision, recall, _ = precision_recall_curve(y_true, y_score)
-    # sklearn returns recall in descending order; reverse for trapezoidal auc.
-    return float(auc(recall[::-1], precision[::-1]))
 
 
 def format_metric(values: List[float]) -> str:
@@ -200,9 +163,6 @@ def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]
     cnt_wait = 0
     best = 1e9
     best_t = 0
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / "checkpoint.pkl"
 
     loop = range(args.num_epoch)
     if args.tqdm:
@@ -260,13 +220,13 @@ def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]
             best = mean_loss
             best_t = epoch
             cnt_wait = 0
-            torch.save(model.state_dict(), checkpoint_path)
+            torch.save(model.state_dict(), args.checkpoint_path)
         else:
             cnt_wait += 1
             if cnt_wait == args.patience:
                 break
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model.load_state_dict(torch.load(args.checkpoint_path, map_location=device))
     model.eval()
     multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes), dtype=np.float64)
 
@@ -340,8 +300,11 @@ def train_one_trial(args, seed, data_bundle, device) -> Tuple[float, float, int]
 
 
 def main():
-    args = resolve_defaults(build_parser().parse_args())
+    args = build_parser().parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    args.checkpoint_path = cache_dir / "checkpoint.pkl"
 
     data_bundle = load_mat(args.dataset, data_root=args.data_root)
 
