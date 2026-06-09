@@ -1,15 +1,15 @@
+import os
+import random
+from typing import List, Sequence, Tuple
+
 import numpy as np
-import networkx as nx
+import scipy.io as sio
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
-import scipy.io as sio
-import random
-import dgl
+from torch_geometric.data import Data
+from torch_geometric.utils import from_scipy_sparse_matrix, remove_self_loops, to_undirected
 
-###############################################
-# Forked from GRAND-Lab/CoLA                  #
-###############################################
 
 def parse_skipgram(fname):
     with open(fname) as f:
@@ -18,74 +18,28 @@ def parse_skipgram(fname):
     nb_features = int(toks[1])
     ret = np.empty((nb_nodes, nb_features))
     it = 2
-    for i in range(nb_nodes):
+    for _ in range(nb_nodes):
         cur_nd = int(toks[it]) - 1
         it += 1
         for j in range(nb_features):
-            cur_ft = float(toks[it])
-            ret[cur_nd][j] = cur_ft
+            ret[cur_nd][j] = float(toks[it])
             it += 1
     return ret
 
 
-def process_tu(data, nb_nodes):
-    nb_graphs = len(data)
-    ft_size = data.num_features
-
-    features = np.zeros((nb_graphs, nb_nodes, ft_size))
-    adjacency = np.zeros((nb_graphs, nb_nodes, nb_nodes))
-    labels = np.zeros(nb_graphs)
-    sizes = np.zeros(nb_graphs, dtype=np.int32)
-    masks = np.zeros((nb_graphs, nb_nodes))
-       
-    for g in range(nb_graphs):
-        sizes[g] = data[g].x.shape[0]
-        features[g, :sizes[g]] = data[g].x
-        labels[g] = data[g].y[0]
-        masks[g, :sizes[g]] = 1.0
-        e_ind = data[g].edge_index
-        coo = sp.coo_matrix((np.ones(e_ind.shape[1]), (e_ind[0, :], e_ind[1, :])), shape=(nb_nodes, nb_nodes))
-        adjacency[g] = coo.todense()
-
-    return features, adjacency, labels, sizes, masks
-
-
 def micro_f1(logits, labels):
-    preds = torch.round(nn.Sigmoid()(logits))
-    preds = preds.long()
+    preds = torch.round(nn.Sigmoid()(logits)).long()
     labels = labels.long()
-
     tp = torch.nonzero(preds * labels).shape[0] * 1.0
     tn = torch.nonzero((preds - 1) * (labels - 1)).shape[0] * 1.0
     fp = torch.nonzero(preds * (labels - 1)).shape[0] * 1.0
     fn = torch.nonzero((preds - 1) * labels).shape[0] * 1.0
-
     prec = tp / (tp + fp)
     rec = tp / (tp + fn)
-    f1 = (2 * prec * rec) / (prec + rec)
-    return f1
+    return (2 * prec * rec) / (prec + rec)
 
-
-def adj_to_bias(adj, sizes, nhood=1):
-    nb_graphs = adj.shape[0]
-    mt = np.empty(adj.shape)
-    for g in range(nb_graphs):
-        mt[g] = np.eye(adj.shape[1])
-        for _ in range(nhood):
-            mt[g] = np.matmul(mt[g], (adj[g] + np.eye(adj.shape[1])))
-        for i in range(sizes[g]):
-            for j in range(sizes[g]):
-                if mt[g][i][j] > 0.0:
-                    mt[g][i][j] = 1.0
-    return -1e9 * (1.0 - mt)
-
-
-###############################################
-# This section of code adapted from tkipf/gcn #
-###############################################
 
 def parse_index_file(filename):
-    """Parse index file."""
     index = []
     for line in open(filename):
         index.append(int(line.strip()))
@@ -93,178 +47,231 @@ def parse_index_file(filename):
 
 
 def sample_mask(idx, l):
-    """Create mask."""
     mask = np.zeros(l)
     mask[idx] = 1
-    return np.array(mask, dtype=np.bool)
+    return np.array(mask, dtype=bool)
 
 
 def sparse_to_tuple(sparse_mx, insert_batch=False):
-    """Convert sparse matrix to tuple representation."""
-    """Set insert_batch=True if you want to insert a batch dimension."""
     def to_tuple(mx):
         if not sp.isspmatrix_coo(mx):
             mx = mx.tocoo()
         if insert_batch:
             coords = np.vstack((np.zeros(mx.row.shape[0]), mx.row, mx.col)).transpose()
-            values = mx.data
             shape = (1,) + mx.shape
         else:
             coords = np.vstack((mx.row, mx.col)).transpose()
-            values = mx.data
             shape = mx.shape
-        return coords, values, shape
+        return coords, mx.data, shape
 
     if isinstance(sparse_mx, list):
         for i in range(len(sparse_mx)):
             sparse_mx[i] = to_tuple(sparse_mx[i])
     else:
         sparse_mx = to_tuple(sparse_mx)
-
     return sparse_mx
 
 
-def standardize_data(f, train_mask):
-    """Standardize feature matrix and convert to tuple representation"""
-    # standardize data
-    f = f.todense()
-    mu = f[train_mask == True, :].mean(axis=0)
-    sigma = f[train_mask == True, :].std(axis=0)
-    f = f[:, np.squeeze(np.array(sigma > 0))]
-    mu = f[train_mask == True, :].mean(axis=0)
-    sigma = f[train_mask == True, :].std(axis=0)
-    f = (f - mu) / sigma
-    return f
-
-
 def preprocess_features(features):
-    """Row-normalize feature matrix and convert to tuple representation"""
     rowsum = np.array(features.sum(1))
     r_inv = np.power(rowsum, -1).flatten()
-    r_inv[np.isinf(r_inv)] = 0.
+    r_inv[np.isinf(r_inv)] = 0.0
     r_mat_inv = sp.diags(r_inv)
     features = r_mat_inv.dot(features)
     return features.todense(), sparse_to_tuple(features)
 
 
 def normalize_adj(adj):
-    """Symmetrically normalize adjacency matrix."""
     adj = sp.coo_matrix(adj)
     rowsum = np.array(adj.sum(1))
     d_inv_sqrt = np.power(rowsum, -0.5).flatten()
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
 
 
 def preprocess_adj(adj):
-    """Preprocessing of adjacency matrix for simple GCN model and conversion to tuple representation."""
     adj_normalized = normalize_adj(adj + sp.eye(adj.shape[0]))
     return sparse_to_tuple(adj_normalized)
 
 
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):
-    """Convert a scipy sparse matrix to a torch sparse tensor."""
     sparse_mx = sparse_mx.tocoo().astype(np.float32)
-    indices = torch.from_numpy(
-        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
-    return torch.sparse.FloatTensor(indices, values, shape)
-
-
-def adj_to_dict(adj,hop=1,min_len=8):
-    adj = np.array(adj.todense(),dtype=np.float64)
-    num_node = adj.shape[0]
-    # adj += np.eye(num_node)
-
-    adj_diff = adj
-    if hop > 1:
-        for _ in range(hop - 1):
-            adj_diff = adj_diff.dot(adj)
-
-
-    dict = {}
-    for i in range(num_node):
-        dict[i] = []
-        for j in range(num_node):
-            if adj_diff[i,j] > 0:
-                dict[i].append(j)
-
-    final_dict = dict.copy()
-
-    for i in range(num_node):
-        while len(final_dict[i]) < min_len:
-            final_dict[i].append(random.choice(dict[random.choice(dict[i])]))
-    return dict
+    return torch.sparse_coo_tensor(indices, values, shape)
 
 
 def dense_to_one_hot(labels_dense, num_classes):
-    """Convert class labels from scalars to one-hot vectors."""
     num_labels = labels_dense.shape[0]
     index_offset = np.arange(num_labels) * num_classes
     labels_one_hot = np.zeros((num_labels, num_classes))
-    labels_one_hot.flat[index_offset+labels_dense.ravel()] = 1
+    labels_one_hot.flat[index_offset + labels_dense.ravel()] = 1
     return labels_one_hot
 
 
-def load_mat(dataset, train_rate=0.3, val_rate=0.1):
-    data = sio.loadmat("./dataset/{}.mat".format(dataset))
-    label = data['Label'] if ('Label' in data) else data['gnd']
-    attr = data['Attributes'] if ('Attributes' in data) else data['X']
-    network = data['Network'] if ('Network' in data) else data['A']
+def _first_existing_key(data, keys):
+    for key in keys:
+        if key in data:
+            return data[key]
+    raise KeyError(f"None of keys {keys} found in .mat file. Available keys: {list(data.keys())}")
+
+
+def load_mat(dataset, data_root="~/datasets/GAD/mat", train_rate=0.3, val_rate=0.1):
+    """Load GAD .mat dataset from ~/datasets/GAD/mat by default.
+
+    Expected common keys:
+    - adjacency: Network or A
+    - attributes: Attributes or X
+    - anomaly labels: Label or gnd
+    - optional class labels: Class
+    """
+    path = os.path.join(os.path.expanduser(data_root), f"{dataset}.mat")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset file not found: {path}")
+
+    data = sio.loadmat(path)
+    label = _first_existing_key(data, ["Label", "gnd", "label", "y"])
+    attr = _first_existing_key(data, ["Attributes", "X", "features", "attr"])
+    network = _first_existing_key(data, ["Network", "A", "adj", "graph"])
 
     adj = sp.csr_matrix(network)
     feat = sp.lil_matrix(attr)
 
-    labels = np.squeeze(np.array(data['Class'],dtype=np.int64) - 1)
-    num_classes = np.max(labels) + 1
-    labels = dense_to_one_hot(labels,num_classes)
-
-    ano_labels = np.squeeze(np.array(label))
-    if 'str_anomaly_label' in data:
-        str_ano_labels = np.squeeze(np.array(data['str_anomaly_label']))
-        attr_ano_labels = np.squeeze(np.array(data['attr_anomaly_label']))
+    if "Class" in data:
+        labels_dense = np.squeeze(np.array(data["Class"], dtype=np.int64) - 1)
+        num_classes = int(np.max(labels_dense)) + 1
+        labels = dense_to_one_hot(labels_dense, num_classes)
     else:
-        str_ano_labels = None
-        attr_ano_labels = None
+        # Some GAD datasets only provide anomaly labels. The training code does not use class labels.
+        labels = np.zeros((adj.shape[0], 1), dtype=np.float32)
+
+    ano_labels = np.squeeze(np.array(label)).astype(np.int64)
+    str_ano_labels = np.squeeze(np.array(data["str_anomaly_label"])) if "str_anomaly_label" in data else None
+    attr_ano_labels = np.squeeze(np.array(data["attr_anomaly_label"])) if "attr_anomaly_label" in data else None
 
     num_node = adj.shape[0]
     num_train = int(num_node * train_rate)
     num_val = int(num_node * val_rate)
     all_idx = list(range(num_node))
     random.shuffle(all_idx)
-    idx_train = all_idx[ : num_train]
-    idx_val = all_idx[num_train : num_train + num_val]
-    idx_test = all_idx[num_train + num_val : ]
-
+    idx_train = all_idx[:num_train]
+    idx_val = all_idx[num_train:num_train + num_val]
+    idx_test = all_idx[num_train + num_val:]
     return adj, feat, labels, idx_train, idx_val, idx_test, ano_labels, str_ano_labels, attr_ano_labels
 
 
-def adj_to_dgl_graph(adj):
-    nx_graph = nx.from_scipy_sparse_matrix(adj)
-    dgl_graph = dgl.DGLGraph(nx_graph)
-    return dgl_graph
+def adj_to_pyg_data(adj: sp.spmatrix, make_undirected: bool = True) -> Data:
+    """Convert scipy adjacency to a PyG Data object.
+
+    This replaces the old DGLGraph construction. The current SL-GAD training loop
+    still uses dense local subgraph adjacencies, while PyG is used for graph storage
+    and RWR-style subgraph sampling.
+    """
+    edge_index, edge_weight = from_scipy_sparse_matrix(adj.tocoo())
+    edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
+    if make_undirected:
+        edge_index = to_undirected(edge_index, num_nodes=adj.shape[0])
+        edge_weight = None
+    return Data(edge_index=edge_index.long(), edge_weight=edge_weight, num_nodes=adj.shape[0])
 
 
-def generate_rwr_subgraph(dgl_graph, subgraph_size):
-    all_idx = list(range(dgl_graph.number_of_nodes()))
+def build_neighbor_lists(edge_index: torch.Tensor, num_nodes: int) -> List[List[int]]:
+    edge_index = edge_index.detach().cpu()
+    neighbors = [[] for _ in range(num_nodes)]
+    src, dst = edge_index[0].tolist(), edge_index[1].tolist()
+    for u, v in zip(src, dst):
+        if u != v:
+            neighbors[u].append(v)
+    # Deduplicate to avoid overweighting duplicate edges after to_undirected/coalescing differences.
+    return [list(dict.fromkeys(nbrs)) for nbrs in neighbors]
+
+
+def _sample_rwr_unique_nodes(
+    seed: int,
+    neighbors: Sequence[Sequence[int]],
+    target_size: int,
+    restart_prob: float,
+    max_steps: int,
+) -> List[int]:
+    """Collect unique nodes using random walk with restart.
+
+    The returned list excludes the seed when possible. The caller appends the seed as
+    the final/main-vertex position, matching the original SL-GAD layout.
+    """
+    if target_size <= 0:
+        return []
+
+    current = seed
+    visited = []
+    seen = set()
+    for _ in range(max_steps):
+        if random.random() < restart_prob:
+            current = seed
+
+        nbrs = neighbors[current]
+        if not nbrs:
+            current = seed
+            continue
+        current = random.choice(nbrs)
+
+        if current != seed and current not in seen:
+            seen.add(current)
+            visited.append(current)
+            if len(visited) >= target_size:
+                break
+    return visited
+
+
+def generate_rwr_subgraph(
+    pyg_data: Data,
+    subgraph_size: int,
+    restart_prob: float = 0.9,
+    max_steps_factor: int = 5,
+) -> List[List[int]]:
+    """Generate per-node RWR subgraphs without DGL.
+
+    Output format matches the original function:
+    [neighbor_1, ..., neighbor_{subgraph_size-1}, center_node]
+    """
+    num_nodes = int(pyg_data.num_nodes)
     reduced_size = subgraph_size - 1
-    traces = dgl.contrib.sampling.random_walk_with_restart(dgl_graph, all_idx, restart_prob=1.0,
-                                                             max_nodes_per_seed=subgraph_size * 3)
-    subv = []
+    neighbors = build_neighbor_lists(pyg_data.edge_index, num_nodes)
+    subgraphs = []
 
-    for i, trace in enumerate(traces):
-        subv.append(torch.unique(torch.cat(trace), sorted=False).tolist())
+    for seed in range(num_nodes):
+        nodes = _sample_rwr_unique_nodes(
+            seed=seed,
+            neighbors=neighbors,
+            target_size=reduced_size,
+            restart_prob=restart_prob,
+            max_steps=max(subgraph_size * max_steps_factor, 20),
+        )
+
         retry_time = 0
-        while len(subv[i]) < reduced_size:
-            cur_trace = dgl.contrib.sampling.random_walk_with_restart(dgl_graph, [i], restart_prob=0.9,
-                                                                      max_nodes_per_seed=subgraph_size * 5)
-            subv[i] = torch.unique(torch.cat(cur_trace[0]), sorted=False).tolist()
+        while len(nodes) < reduced_size and retry_time < 10:
+            more = _sample_rwr_unique_nodes(
+                seed=seed,
+                neighbors=neighbors,
+                target_size=reduced_size,
+                restart_prob=restart_prob,
+                max_steps=max(subgraph_size * max_steps_factor * 2, 40),
+            )
+            for node in more:
+                if node not in nodes:
+                    nodes.append(node)
+                if len(nodes) >= reduced_size:
+                    break
             retry_time += 1
-            if (len(subv[i]) <= reduced_size) and (retry_time > 10):
-                subv[i] = (subv[i] * reduced_size)
 
-        subv[i] = subv[i][:reduced_size]
-        subv[i].append(i)
-    return subv
+        if len(nodes) < reduced_size:
+            # Isolated or very low-degree node: pad deterministically with the seed.
+            pad_value = nodes[-1] if nodes else seed
+            nodes = (nodes + [pad_value] * reduced_size)[:reduced_size]
+        else:
+            nodes = nodes[:reduced_size]
+
+        nodes.append(seed)
+        subgraphs.append(nodes)
+    return subgraphs
